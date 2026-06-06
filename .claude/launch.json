@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "CB08 Transcriber",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["serve", "-p", "7423", "/Users/damian/Desktop/Code/BluetoothAIVoice"],
+      "port": 7423
+    }
+  ]
+}
