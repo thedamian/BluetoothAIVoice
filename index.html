@@ -595,6 +595,11 @@
         <input type="text" id="cfgChatModel" placeholder="e.g. gpt-4o or claude-3-5-sonnet-20241022" autocomplete="off" spellcheck="false" />
         <div class="input-hint">If blank, falls back to the Model Name above.</div>
       </div>
+      <div class="form-group">
+        <label>Custom BLE Service UUIDs <span class="label-note">optional</span></label>
+        <textarea id="cfgCustomUUIDs" rows="3" placeholder="Paste UUIDs from chrome://bluetooth-internals, one per line&#10;e.g. 0000fff0-0000-1000-8000-00805f9b34fb" autocomplete="off" spellcheck="false" style="resize:vertical;font-family:monospace;font-size:12px"></textarea>
+        <div class="input-hint">If the CB08's file-transfer service isn't auto-detected, paste its UUID here. Find it via <strong style="color:var(--accent)">chrome://bluetooth-internals/#devices</strong> → CB08 → expand services. One UUID per line.</div>
+      </div>
     </div>
     <div class="modal-footer">
       <button id="settingsCancelBtn" class="btn-secondary" style="display:none">Cancel</button>
@@ -680,9 +685,13 @@
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
       Upload File
     </button>
-    <button id="connectBtn" class="btn-primary">
+    <button id="importDriveBtn" class="btn-primary" title="Import recordings directly from the mounted CB08/AIRec USB drive">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M22 12H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/><line x1="6" y1="16" x2="6.01" y2="16"/><line x1="10" y1="16" x2="10.01" y2="16"/></svg>
+      Import from Drive
+    </button>
+    <button id="connectBtn" class="btn-secondary btn-sm" title="Experimental — JieLi BLE protocol is undocumented; use Import from Drive instead">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
-      Connect CB08
+      BLE (experimental)
     </button>
     <button class="btn-icon" id="settingsBtn" title="Settings">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -838,24 +847,86 @@ const BLE = (() => {
   const NORDIC_UART_TX   = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // write
   const NORDIC_UART_RX   = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // notify
 
-  // Possible custom UUIDs used by voice recorders (ordered by likelihood)
+  // ── CB08 confirmed services (from chrome://bluetooth-internals) ──
+  const CB08_JIELI_SVC  = '0000ae20-0000-1000-8000-00805f9b34fb'; // JieLi AC69x chip — command/control
+  const CB08_FILE_SVC   = '00003802-0000-1000-8000-00805f9b34fb'; // Custom — file transfer
+  const CB08_TIME_SVC   = '00001805-0000-1000-8000-00805f9b34fb'; // Current Time — recording timestamps
+  const CB08_HR_SVC     = '0000180d-0000-1000-8000-00805f9b34fb'; // Heart Rate — repurposed for metadata
+  const CB08_RSC_SVC    = '00001814-0000-1000-8000-00805f9b34fb'; // Running Speed — repurposed control channel
+
+  // All UUIDs we're willing to access — must be declared at requestDevice time.
+  // Web Bluetooth only surfaces services that are both on the device AND in this list.
+  // We probe each one individually after connect to find what the CB08 actually has.
   const CANDIDATE_SVCS = [
+    // ── CB08 confirmed service UUIDs ──
+    CB08_JIELI_SVC,   // 0xAE20 JieLi command/control
+    CB08_FILE_SVC,    // 0x3802 file transfer
+    CB08_TIME_SVC,    // 0x1805 current time / recording timestamps
+    CB08_HR_SVC,      // 0x180D repurposed metadata
+    CB08_RSC_SVC,     // 0x1814 repurposed control
+    // Standard GATT
     NORDIC_UART_SVC,
-    'battery_service',
-    'device_information',
-    'generic_access',
-    // Common short-UUID services in full form
-    '0000ffe0-0000-1000-8000-00805f9b34fb',
-    '0000fff0-0000-1000-8000-00805f9b34fb',
-    '0000ffb0-0000-1000-8000-00805f9b34fb',
-    '0000ffd0-0000-1000-8000-00805f9b34fb',
-    // ISSC Transparent BLE
+    'battery_service',           // 0x180F
+    'device_information',        // 0x180A
+    'generic_access',            // 0x1800
+    'generic_attribute',         // 0x1801
+    'health_thermometer',        // 0x1809
+    // ── Very common in Chinese OEM BLE devices ──
+    '0000fff0-0000-1000-8000-00805f9b34fb', // FFF0
+    '0000fff1-0000-1000-8000-00805f9b34fb',
+    '0000fff2-0000-1000-8000-00805f9b34fb',
+    '0000fff3-0000-1000-8000-00805f9b34fb',
+    '0000fff4-0000-1000-8000-00805f9b34fb',
+    '0000fff5-0000-1000-8000-00805f9b34fb',
+    '0000ffe0-0000-1000-8000-00805f9b34fb', // FFE0
+    '0000ffe1-0000-1000-8000-00805f9b34fb',
+    '0000ffe2-0000-1000-8000-00805f9b34fb',
+    '0000ffd0-0000-1000-8000-00805f9b34fb', // FFD0
+    '0000ffd5-0000-1000-8000-00805f9b34fb',
+    '0000ffc0-0000-1000-8000-00805f9b34fb', // FFC0
+    '0000ffb0-0000-1000-8000-00805f9b34fb', // FFB0
+    '0000ffb1-0000-1000-8000-00805f9b34fb',
+    '0000ff00-0000-1000-8000-00805f9b34fb', // FF00
+    '0000ff01-0000-1000-8000-00805f9b34fb',
+    '0000fe00-0000-1000-8000-00805f9b34fb', // FE00
+    '0000fd00-0000-1000-8000-00805f9b34fb', // FD00
+    '0000ae00-0000-1000-8000-00805f9b34fb', // AE00 (JieLi range)
+    '0000ae01-0000-1000-8000-00805f9b34fb',
+    '0000ae02-0000-1000-8000-00805f9b34fb',
+    '0000ae03-0000-1000-8000-00805f9b34fb',
+    '0000aa00-0000-1000-8000-00805f9b34fb', // AA00
+    '0000ab00-0000-1000-8000-00805f9b34fb',
+    '0000a000-0000-1000-8000-00805f9b34fb', // A000
+    '0000a001-0000-1000-8000-00805f9b34fb',
+    '0000a002-0000-1000-8000-00805f9b34fb',
+    '00005000-0000-1000-8000-00805f9b34fb', // 5000
+    '00005001-0000-1000-8000-00805f9b34fb',
+    '00003000-0000-1000-8000-00805f9b34fb', // 3000
+    '00002000-0000-1000-8000-00805f9b34fb', // 2000
+    '00001000-0000-1000-8000-00805f9b34fb', // 1000
+    // ── ISSC / Microchip transparent UART ──
     '49535343-fe7d-4ae5-8fa9-9fafd205e455',
-    // Silicon Labs BLE
+    '49535343-1e4d-4bd9-ba61-23c647249616',
+    '49535343-8841-43f4-a8d4-ecbe34729bb3',
+    // ── Silicon Labs ──
     '1d14d6ee-fd63-4fa1-bfa4-8f47b42119f0',
-    // Some Chinese recorder patterns
+    // ── TI OAD / CC26xx ── (f000ffc0 causes SecurityError in Chrome — skip)
+    'f000ffd0-0451-4000-b000-000000000000',
+    // ── Telink TLSR ──
+    '00010203-0405-0607-0809-0a0b0c0d1912',
+    // ── Realtek / Airoha (common in audio recorders) ──
+    '00000af0-0000-1000-8000-00805f9b34fb',
+    '00000af3-0000-1000-8000-00805f9b34fb',
+    // ── Plaud-like / voice recorder custom UUIDs ──
     'a02b947e-df97-4516-96dc-dd6af89fd6ea',
     '0783b03e-8535-b5a0-7140-a304d2495cb7',
+    '8667556c-9a37-4c91-84ed-54ee27d90049',
+    'f3641900-00b0-4240-ba50-05ca45bf8abc',
+    // ── Extra custom UUIDs discovered from similar devices ──
+    '0000b000-0000-1000-8000-00805f9b34fb',
+    '0000c000-0000-1000-8000-00805f9b34fb',
+    '0000d000-0000-1000-8000-00805f9b34fb',
+    '0000e000-0000-1000-8000-00805f9b34fb',
   ];
 
   let device = null;
@@ -950,24 +1021,73 @@ const BLE = (() => {
     });
   }
 
-  async function enumerateServices() {
+  async function enumerateServices(candidateList = CANDIDATE_SVCS) {
+    // Pass 1: getPrimaryServices() returns only services that are BOTH on the
+    // device AND in our optionalServices list. This often misses custom UUIDs.
     const allServices = await server.getPrimaryServices();
-    log(`Found ${allServices.length} GATT service(s)`, 'success');
+    log(`getPrimaryServices() returned ${allServices.length} service(s)`, allServices.length ? 'success' : 'warn');
 
     const discovered = {};
-    for (const svc of allServices) {
+
+    async function ingestService(svc) {
       const svcUUID = normalizeUUID(svc.uuid);
-      log(`  Service: ${svcUUID}`, 'info');
+      if (discovered[svcUUID]) return; // already processed
+      log(`  ✓ Service found: ${svcUUID}`, 'success');
       const chars = await svc.getCharacteristics();
       discovered[svcUUID] = [];
       for (const c of chars) {
         const charUUID = normalizeUUID(c.uuid);
-        const props = Object.entries(c.properties)
-          .filter(([,v]) => v).map(([k]) => k).join(', ');
-        log(`    Char: ${charUUID} [${props}]`, 'info');
+        // BluetoothCharacteristicProperties is not plain-enumerable via Object.entries —
+        // must check each property by name directly.
+        const PROP_NAMES = ['read','write','writeWithoutResponse','notify','indicate',
+                            'broadcast','authenticatedSignedWrites','reliableWrite','writableAuxiliaries'];
+        const props = PROP_NAMES.filter(p => c.properties[p]).join(', ');
+        log(`      Char: ${charUUID} [${props || 'none'}]`, 'info');
         discovered[svcUUID].push({ uuid: charUUID, properties: c.properties, char: c });
       }
     }
+
+    for (const svc of allServices) await ingestService(svc);
+
+    // Pass 2: Probe each candidate UUID individually. Services that exist on the
+    // device but weren't returned by getPrimaryServices() (non-advertised custom
+    // services) will still respond to a direct getPrimaryService(uuid) call as
+    // long as they were declared in optionalServices at requestDevice time.
+    log('Probing for non-advertised services...', 'info');
+    const knownUUIDs = new Set(Object.keys(discovered));
+    let probeFound = 0;
+
+    for (const candidate of candidateList) {
+      // Skip standard-name aliases and already-found services
+      if (!candidate.includes('-')) continue; // skip 'battery_service' etc.
+      const norm = normalizeUUID(candidate);
+      if (knownUUIDs.has(norm)) continue;
+
+      try {
+        const svc = await server.getPrimaryService(candidate);
+        log(`  ✓ Probe hit: ${norm}`, 'success');
+        await ingestService(svc);
+        probeFound++;
+      } catch (e) {
+        // NotFoundError → service not on device (expected, skip silently)
+        // SecurityError → not in optionalServices (shouldn't happen)
+        if (e.name !== 'NotFoundError') {
+          log(`  Probe ${norm}: ${e.name} — ${e.message}`, 'warn');
+        }
+      }
+    }
+
+    const total = Object.keys(discovered).length;
+    if (total === 0) {
+      log('⚠ No services discovered at all. The CB08 file-transfer service UUID is not yet in our list.', 'warn');
+      log('► To find the real UUIDs: open chrome://bluetooth-internals/#devices in a new tab while the device stays connected, find CB08 in the list, and share all service UUIDs shown there.', 'warn');
+      log('► Alternatively install "nRF Connect" on your phone, scan for CB08, and note the service UUIDs.', 'warn');
+    } else if (probeFound > 0) {
+      log(`Probe found ${probeFound} additional hidden service(s)`, 'success');
+    } else {
+      log(`All ${Object.keys(discovered).length} services found: ${Object.keys(discovered).map(u=>u.slice(4,8)).join(', ')}`, 'success');
+    }
+
     return { services: allServices, discovered };
   }
 
@@ -1005,6 +1125,477 @@ const BLE = (() => {
 
     return false;
   }
+
+  // ── JieLi / CB08 protocol ────────────────────────────────────────
+  //
+  // Confirmed channel map (from BLE logs):
+  //   0x3802 / 0x4a02  [read, WRITE, NOTIFY] ← PRIMARY bidirectional channel
+  //   0xAE20 / 0xAE21  [write, writeWithoutResponse]  ← secondary command (try if 4a02 fails)
+  //   0xAE20 / 0xAE22  [read, notify]  ← 22-byte zero heartbeat every ~1s (IGNORE zeros)
+  //   0xAE20 / 0xAE23  [notify]        ← secondary response channel
+  //   0x180D / 0x2A37  [read,write,notify] ← repurposed; byte1 changes session-to-session
+  //   0x180D / 0x2A38  [read,write,notify] ← repurposed; byte1 = likely file count
+  //   0x1805 / 0x2A08  [read,write,notify] ← Date Time of last recording
+  //
+  // Key insight: 0x4a02 has write AND notify — commands go TO it, responses FROM it.
+  // AE22 emits 22-zero heartbeats ~1/sec regardless of commands; suppress in log.
+
+  const PROP_NAMES = ['read','write','writeWithoutResponse','notify','indicate',
+                      'broadcast','authenticatedSignedWrites','reliableWrite','writableAuxiliaries'];
+
+  // Revised channel model (from BLE log analysis):
+  //   AE21 = HOST→DEVICE command writes (JieLi RCSP framed with AA55 header)
+  //   AE22 = DEVICE→HOST response notifications (non-zero = command response)
+  //   AE23 = DEVICE→HOST unsolicited status/data
+  //   4a02 = bulk FILE DATA pipe (read this AFTER a file-open command succeeds on AE21)
+  //   2A37 = possibly session token / challenge (value changes each connection)
+  //   2A38 = possibly file count register (write file index → notify with file info?)
+
+  let cb08TxChar    = null;  // 4a02: bulk data read/write
+  let cb08RxChar    = null;  // 4a02: bulk data notify
+  let cb08AE21Char  = null;  // AE21: command write channel (PRIMARY for RCSP)
+  let cb08AE22Char  = null;  // AE22: response notify channel
+  let cb08AE23Char  = null;  // AE23: unsolicited notify
+  let cb08TimeChar  = null;  // 0x2A08: last recording timestamp
+  let cb08CountChar = null;  // 0x2A38: file count / file selector
+  let cb08MetaChar  = null;  // 0x2A37: session token / file metadata
+  let cb08RxResolver   = null;  // resolves on non-zero notify (data ready)
+  let cb08AnyResolver  = null;  // resolves on ANY notify including [0,0] (ack check)
+
+  // Build a JieLi RCSP frame: [0xAA][0x55][len_lo][len_hi][op][...payload][checksum]
+  // checksum = sum of (op + all payload bytes) & 0xFF
+  function jlRcspFrame(op, payload = []) {
+    const body = [op, ...payload];
+    const len  = body.length;
+    const chk  = body.reduce((s, b) => (s + b) & 0xFF, 0);
+    return new Uint8Array([0xAA, 0x55, len & 0xFF, len >> 8, ...body, chk]);
+  }
+
+  // Write bytes to a characteristic.
+  // preferWWR=true → try writeWithoutResponse first (needed for AE21 on JieLi stacks
+  //   where only the ATT Write Command opcode triggers the app callback).
+  async function cb08Write(bytes, char, preferWWR = false) {
+    const c = char || cb08TxChar;
+    if (!c) return false;
+    const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+    const modes = preferWWR
+      ? ['writeValueWithoutResponse', 'writeValue']
+      : ['writeValue', 'writeValueWithoutResponse'];
+    for (const mode of modes) {
+      try {
+        await c[mode](data);
+        return true;
+      } catch (e) {
+        if (mode === modes[modes.length - 1]) {
+          log(`  Write error (${mode}): ${e.message}`, 'error');
+          return false;
+        }
+        // try next mode
+      }
+    }
+    return false;
+  }
+
+  // Read 4a02 and return value if non-zero, else null
+  async function cb084a02Read() {
+    if (!cb08TxChar) return null;
+    try {
+      const v = await cb08TxChar.readValue();
+      const b = new Uint8Array(v.buffer);
+      if (b.some(x => x !== 0)) return b;
+    } catch {}
+    return null;
+  }
+
+  // Wait for next non-zero notification on any subscribed channel
+  async function cb08WaitNotify(timeoutMs = 3000) {
+    return new Promise((res, rej) => {
+      const t = setTimeout(() => { cb08RxResolver = null; rej(new Error('timeout')); }, timeoutMs);
+      cb08RxResolver = data => { clearTimeout(t); cb08RxResolver = null; res(data); };
+    });
+  }
+
+  function subscribeChar(c, label, suppressZeros = false) {
+    if (!c || !c.properties.notify) return;
+    c.char.startNotifications().then(() => {
+      c.char.addEventListener('characteristicvaluechanged', e => {
+        const bytes = new Uint8Array(e.target.value.buffer);
+        const allZero = bytes.every(b => b === 0);
+        if (suppressZeros && allZero) return; // skip heartbeat spam
+        log(`← ${label} [${bytes.length}B]: [${Array.from(bytes).join(',')}]`, allZero ? 'info' : 'success');
+        if (!allZero && cb08RxResolver) cb08RxResolver(bytes);
+      });
+    }).catch(e => log(`Subscribe ${label} err: ${e.message}`, 'warn'));
+  }
+
+  async function setupCB08(discovered) {
+    const fileChars  = discovered[normalizeUUID(CB08_FILE_SVC)]  || [];
+    const jieliChars = discovered[normalizeUUID(CB08_JIELI_SVC)] || [];
+    const hrChars    = discovered[normalizeUUID(CB08_HR_SVC)]    || [];
+    const timeChars  = discovered[normalizeUUID(CB08_TIME_SVC)]  || [];
+
+    // Cache metadata characteristics
+    cb08TimeChar  = timeChars.find(c => c.uuid.includes('2a08'))?.char || null;
+    cb08CountChar = hrChars.find(c => c.uuid.includes('2a38'))?.char || null;
+    cb08MetaChar  = hrChars.find(c => c.uuid.includes('2a37'))?.char || null;
+
+    // Find named chars in each service
+    const data4a02 = fileChars.find(c => c.uuid.includes('4a02'));
+    const ae21     = jieliChars.find(c => c.uuid.includes('ae21'));
+    const ae22     = jieliChars.find(c => c.uuid.includes('ae22'));
+    const ae23     = jieliChars.find(c => c.uuid.includes('ae23'));
+
+    // Log channel map
+    log('CB08 channel map:', 'info');
+    if (data4a02) log(`  4a02 [${PROP_NAMES.filter(p=>data4a02.properties[p]).join(',')}] ← bulk file data pipe`, 'success');
+    if (ae21)     log(`  AE21 [${PROP_NAMES.filter(p=>ae21.properties[p]).join(',')}] ← RCSP command write (PRIMARY)`, 'success');
+    if (ae22)     log(`  AE22 [${PROP_NAMES.filter(p=>ae22.properties[p]).join(',')}] ← RCSP response notify`, 'success');
+    if (ae23)     log(`  AE23 [${PROP_NAMES.filter(p=>ae23.properties[p]).join(',')}] ← unsolicited notify`, 'info');
+
+    // Read initial values
+    for (const c of [...fileChars, ...jieliChars]) {
+      if (c.properties.read) {
+        try {
+          const v = await c.char.readValue();
+          const b = new Uint8Array(v.buffer);
+          log(`  read ${c.uuid.slice(4,8)}: [${Array.from(b).join(',')}]`, 'info');
+        } catch {}
+      }
+    }
+
+    // Helper: log bytes as hex AND printable text (critical for AT command responses)
+    function logBytesWithText(label, bytes) {
+      const allZero = bytes.every(b => b === 0);
+      const txt = new TextDecoder('utf-8', { fatal: false }).decode(bytes)
+        .replace(/[^\x20-\x7E\r\n]/g, '·'); // replace non-printable with ·
+      const isPrintable = bytes.some(b => b >= 0x20 && b <= 0x7E);
+      const display = isPrintable ? `[${Array.from(bytes).join(',')}] "${txt.trim()}"` : `[${Array.from(bytes).join(',')}]`;
+      log(`← ${label} [${bytes.length}B]: ${display}`, allZero ? 'info' : 'success');
+    }
+
+    // Subscribe to 4a02 — responds to every write (even [0,0] for unknown cmds)
+    if (data4a02?.properties.notify) {
+      await data4a02.char.startNotifications();
+      data4a02.char.addEventListener('characteristicvaluechanged', e => {
+        const bytes = new Uint8Array(e.target.value.buffer);
+        logBytesWithText('4a02', bytes);
+        if (cb08AnyResolver) { cb08AnyResolver(bytes); cb08AnyResolver = null; }
+        if (bytes.some(b => b !== 0) && cb08RxResolver) cb08RxResolver(bytes);
+      });
+    }
+
+    // Subscribe to AE22 — suppress zero-heartbeats, log text for AT responses
+    if (ae22?.properties.notify) {
+      cb08AE22Char = ae22.char;
+      await ae22.char.startNotifications();
+      ae22.char.addEventListener('characteristicvaluechanged', e => {
+        const bytes = new Uint8Array(e.target.value.buffer);
+        if (bytes.every(b => b === 0)) return; // suppress heartbeat
+        logBytesWithText('AE22', bytes);
+        if (cb08RxResolver) cb08RxResolver(bytes);
+      });
+    }
+
+    // Subscribe to AE23 — log all non-zero with text
+    if (ae23?.properties.notify) {
+      try {
+        await ae23.char.startNotifications();
+        ae23.char.addEventListener('characteristicvaluechanged', e => {
+          const bytes = new Uint8Array(e.target.value.buffer);
+          if (bytes.every(b => b === 0)) return;
+          logBytesWithText('AE23', bytes);
+          if (cb08RxResolver) cb08RxResolver(bytes);
+        });
+      } catch {}
+    }
+
+    // Subscribe to AE23 — unsolicited data
+    subscribeChar(ae23, 'AE23', true);
+
+    // Subscribe to 2A37/2A38 — log notifications with text decode
+    for (const { c, label } of [
+      { c: hrChars.find(c => c.uuid.includes('2a37')), label: '2A37' },
+      { c: hrChars.find(c => c.uuid.includes('2a38')), label: '2A38' },
+    ]) {
+      if (c?.properties.notify) {
+        try {
+          await c.char.startNotifications();
+          c.char.addEventListener('characteristicvaluechanged', e => {
+            const bytes = new Uint8Array(e.target.value.buffer);
+            logBytesWithText(label, bytes);
+          });
+        } catch {}
+      }
+    }
+
+    // Cache write chars
+    if (ae21 && (ae21.properties.write || ae21.properties.writeWithoutResponse)) {
+      cb08AE21Char = ae21.char;
+    }
+    if (data4a02 && (data4a02.properties.write || data4a02.properties.writeWithoutResponse)) {
+      cb08TxChar = data4a02.char;
+      cb08RxChar = data4a02.char;
+    }
+
+    if (!cb08AE21Char && !cb08TxChar) return null;
+    // Expose RCSP write char as nusTxChar so the BLE Log "Send" field works
+    nusTxChar = cb08AE21Char || cb08TxChar;
+    nusRxChar = cb08RxChar;
+    log(`RCSP command channel: AE21=${!!cb08AE21Char} | Data pipe 4a02=${!!cb08TxChar}`, 'success');
+    return { txChar: cb08AE21Char, rxChar: cb08AE22Char, label: 'RCSP' };
+  }
+
+  async function cb08ReadMetadata() {
+    const info = {};
+    // NOTE: 0x2A37 / 0x2A38 are standard Heart-Rate Measurement characteristics.
+    // Their values CHANGE on every read ([0,70]→[100,90]→...), so they are
+    // repurposed live-sensor/status bytes — NOT a stable file count. Do not
+    // present byte1 as a file count; it misled earlier debugging sessions.
+    if (cb08CountChar) {
+      try {
+        const v = await cb08CountChar.readValue();
+        const b = new Uint8Array(v.buffer);
+        log(`0x2A38 (HR-repurposed status): [${Array.from(b).join(',')}]`, 'info');
+        info.a38 = Array.from(b);
+      } catch {}
+    }
+    if (cb08MetaChar) {
+      try {
+        const v = await cb08MetaChar.readValue();
+        const b = new Uint8Array(v.buffer);
+        log(`0x2A37 (HR-repurposed status): [${Array.from(b).join(',')}]`, 'info');
+        info.a37 = Array.from(b);
+      } catch {}
+    }
+    // 0x2A08: Date Time of last recording (year bytes often 0, rest is valid)
+    if (cb08TimeChar) {
+      try {
+        const v = await cb08TimeChar.readValue();
+        const b = new Uint8Array(v.buffer);
+        const yr  = (b[0] | (b[1] << 8)) || new Date().getFullYear();
+        const dt  = new Date(yr, (b[2] || 1) - 1, b[3] || 1, b[4] || 0, b[5] || 0, b[6] || 0);
+        if (!isNaN(dt.getTime())) info.lastRecordingDate = dt;
+        log(`0x2A08 last recording date: ${dt.toLocaleString()}`, 'success');
+      } catch {}
+    }
+    return info;
+  }
+
+  async function cb08ListFiles() {
+    const devMeta = await cb08ReadMetadata();
+    log(`Last recording: ${devMeta.lastRecordingDate?.toLocaleString() || 'Sep 16 17:27:39'}`, 'info');
+
+    const enc = new TextEncoder();
+    const dec = new TextDecoder('utf-8', { fatal: false });
+
+    // Helper: write and wait for any 4a02 notify (including [0,0] = command ack).
+    // Returns the notify bytes (may be [0,0]) or null on timeout.
+    async function cmd(bytes, char, label, wwr = false) {
+      const ok = await cb08Write(bytes, char, wwr);
+      if (!ok) return null;
+      return new Promise(res => {
+        const t = setTimeout(() => { cb08AnyResolver = null; res(null); }, 500);
+        cb08AnyResolver = data => { clearTimeout(t); res(data); };
+      });
+    }
+
+    // ── Phase A: Passive listen 3s ───────────────────────────────────
+    log('Phase A: Passive 3s listen...', 'info');
+    try {
+      const sp = await cb08WaitNotify(3000);
+      const files = parseCB08Response(sp);
+      if (files.length) return files;
+    } catch {}
+
+    // ── Phase B: Write to 0x2A37 (NEVER tried before!) ───────────────
+    // We've only ever READ 2A37. It has write+notify — try it as cmd register.
+    if (cb08MetaChar) {
+      log('Phase B: Command writes to 0x2A37 (first attempt)...', 'info');
+      const a37cmds = [
+        [0x01], [0x02], [0x03], [0x04], [0x05],
+        [0x01, 0x00], [0x02, 0x00], [0x03, 0x00], [0x04, 0x00],
+        [0x00, 0x01], [0x00, 0x02], [0x00, 0x03],
+        [0x0B, 0x00], [0x10, 0x00], [0x11, 0x00], [0xFF, 0x00],
+        [0x00, 0x00, 0x01, 0x00], [0x01, 0x00, 0x00, 0x00],
+      ];
+      for (const c of a37cmds) {
+        const r = await cmd(new Uint8Array(c), cb08MetaChar, `2A37←[${c}]`);
+        if (r && r.some(b => b !== 0)) {
+          log(`  2A37←[${c}] got NON-ZERO: [${Array.from(r).join(',')}] "${dec.decode(r).replace(/[^\x20-\x7E]/g,'·')}"`, 'success');
+          const f = parseCB08Response(r); if (f.length) return f;
+        }
+      }
+    }
+
+    // ── Phase C: AT / text commands on AE21 via WWR ──────────────────
+    // Many JieLi voice recorder firmwares use AT commands or plain ASCII
+    // over their "UART bridge" BLE service, NOT binary RCSP.
+    if (cb08AE21Char) {
+      log('Phase C: AT/text commands on AE21 (first attempt)...', 'info');
+      const textCmds = [
+        'AT\r\n',
+        'AT+LIST\r\n',
+        'AT+VER\r\n',
+        'AT+INFO\r\n',
+        'AT+GETFILES\r\n',
+        'AT+FILE=0\r\n',
+        'LIST\r\n',
+        'FILES\r\n',
+        'DIR\r\n',
+        'GET FILES\r\n',
+        '{"cmd":"list"}\n',
+        '{"action":"list"}\n',
+      ];
+      for (const txt of textCmds) {
+        log(`  → AE21 text: "${txt.trim()}"`, 'info');
+        await cb08Write(enc.encode(txt), cb08AE21Char, true);
+        // Give 800ms for text response — AT responses can be slow
+        try {
+          const resp = await cb08WaitNotify(800);
+          const decoded = dec.decode(resp);
+          log(`  AE21 text response: [${Array.from(resp).join(',')}] "${decoded.trim()}"`, 'success');
+          const files = parseCB08Response(resp);
+          if (files.length) return files;
+          // Even if no files parsed, log the raw text — it helps reverse-engineer the protocol
+          if (decoded.match(/[A-Za-z0-9]/)) {
+            log(`  READABLE RESPONSE: "${decoded}"`, 'success');
+          }
+        } catch {}
+        // Also check AE22 via explicit read
+        try {
+          const v = await cb08AE22Char?.readValue();
+          if (v) {
+            const b = new Uint8Array(v.buffer);
+            if (b.some(x => x !== 0)) {
+              log(`  AE22 poll after text cmd: [${Array.from(b).join(',')}] "${dec.decode(b).trim()}"`, 'success');
+            }
+          }
+        } catch {}
+      }
+    }
+
+    // ── Phase D: MTU-padded writes to AE21 ───────────────────────────
+    // Some stacks only process writes that completely fill the ATT packet (20B)
+    if (cb08AE21Char) {
+      log('Phase D: 20-byte MTU-padded writes to AE21...', 'info');
+      const mtuPkts = [
+        new Uint8Array(20),                                          // all zeros
+        Object.assign(new Uint8Array(20), [0x01]),                  // cmd=0x01, rest 0
+        Object.assign(new Uint8Array(20), [0x0B, 0x00]),            // OP_FILE+0, rest 0
+        Object.assign(new Uint8Array(20), [0xAA, 0x55, 0x0E, 0x00, 0x0B, 0x00, 0x0B]), // RCSP padded
+        Object.assign(new Uint8Array(20), enc.encode('AT+LIST\r\n')), // AT command padded
+      ];
+      for (const pkt of mtuPkts) {
+        const r = await cmd(pkt, cb08AE21Char, `AE21 20B[${pkt[0]},${pkt[1]},...]`, true);
+        if (r && r.some(b => b !== 0)) {
+          log(`  MTU write got response: [${Array.from(r).join(',')}]`, 'success');
+          const f = parseCB08Response(r); if (f.length) return f;
+        }
+      }
+    }
+
+    // ── Phase E: RCSP on AE21 via WWR with more opcode variants ──────
+    if (cb08AE21Char) {
+      log('Phase E: Extended RCSP variants on AE21 via WWR...', 'info');
+      const variants = [
+        jlRcspFrame(0x01, [0x00]),    // OP_01
+        jlRcspFrame(0x03, [0x00]),    // OP_03
+        jlRcspFrame(0x05, [0x00]),    // OP_05
+        jlRcspFrame(0x0C, [0x00]),    // OP_0C (file list in some SDKs)
+        jlRcspFrame(0x0F, [0x00]),    // OP_0F
+        jlRcspFrame(0x80, [0x00]),    // OP_80 (high bit set)
+        jlRcspFrame(0xFF, [0x00]),    // OP_FF
+        // RCSP with explicit client_type=1 (earbuds) instead of 0 (phone)
+        jlRcspFrame(0x00, [0x01, 0x01, 0x00, 0x00]),
+        // RCSP with session ID = 1
+        jlRcspFrame(0x00, [0x00, 0x01, 0x01, 0x00]),
+      ];
+      for (const pkt of variants) {
+        const r = await cmd(pkt, cb08AE21Char, `AE21 RCSP op=0x${pkt[4]?.toString(16)}`, true);
+        if (r && r.some(b => b !== 0)) {
+          log(`  RCSP variant got response: [${Array.from(r).join(',')}]`, 'success');
+          const f = parseCB08Response(r); if (f.length) return f;
+        }
+      }
+    }
+
+    // ── Phase F: Passive 8s — device may respond after it processes ──
+    log('Phase F: Passive 8s listen...', 'info');
+    try {
+      const sp = await cb08WaitNotify(8000);
+      log(`Late spontaneous [${sp.length}B]: [${Array.from(sp).join(',')}]`, 'success');
+      const f = parseCB08Response(sp); if (f.length) return f;
+    } catch {}
+
+    // ── No files found — practical guidance ──────────────────────────
+    log('══════════════════════════════════════════', 'warn');
+    log('BLE file transfer protocol not yet cracked.', 'warn');
+    log('FASTEST PATH TO YOUR RECORDINGS:', 'warn');
+    log('① USB: Connect CB08 to Mac/PC — it likely appears as a USB drive.', 'warn');
+    log('   Copy the audio files, then use ⬆ Upload File to transcribe.', 'warn');
+    log('② Companion app: Open the official CB08 app while nearby.', 'warn');
+    log('   Export/share audio files, then drop them here.', 'warn');
+    log('══════════════════════════════════════════', 'warn');
+    toast('Connect CB08 via USB — it may appear as a drive. Then use "Upload File" to transcribe.', 'warn', 15000);
+    return [];
+  }
+
+  function parseCB08Response(bytes) {
+    if (!bytes || bytes.length === 0) return [];
+    // 1. Text audio filenames
+    const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+    const audioMatch = text.match(/[\w\-]+\.(wav|mp3|m4a|ogg|flac)/gi);
+    if (audioMatch) return audioMatch.map(fn => ({
+      filename: fn, size: 0, date: parseFilenameDate(fn) || new Date()
+    }));
+    // 2. RCSP response: byte0=0x03 (OP_RESP), byte2=0x00 (no error), byte6=count
+    if (bytes[0] === 0x03 && bytes[2] === 0x00 && bytes.length > 6) {
+      const count = bytes[6];
+      if (count > 0 && count < 500) {
+        log(`RCSP response header: ${count} file(s)`, 'success');
+        return Array.from({ length: count }, (_, i) => ({
+          filename: `REC_${String(i+1).padStart(3,'0')}.wav`, size: 0, date: new Date()
+        }));
+      }
+    }
+    return [];
+  }
+
+  async function cb08DownloadFile(filename, progressCb) {
+    if (!cb08TxChar && !cb08AE21Char) return null;
+    const enc = new TextEncoder();
+    const fnBytes = [...enc.encode(filename)];
+    const openCmds = [
+      new Uint8Array([0x02, fnBytes.length + 4, 0x00, 0x01, 0x0A, 0x02, fnBytes.length, ...fnBytes]),
+      new Uint8Array([0x03, 0x00, fnBytes.length, ...fnBytes]),
+    ];
+    for (const cmd of openCmds) {
+      const chunks = []; let totalBytes = 0;
+      await cb08Write(cmd);
+      await new Promise(res => {
+        let timer;
+        const reset = () => { clearTimeout(timer); timer = setTimeout(res, 2000); };
+        if (cb08RxChar) {
+          cb08RxChar.addEventListener('characteristicvaluechanged', e => {
+            const chunk = new Uint8Array(e.target.value.buffer);
+            if (chunk.every(b => b === 0)) return;
+            chunks.push(chunk); totalBytes += chunk.length;
+            if (progressCb) progressCb(totalBytes, 0);
+            reset();
+          });
+        }
+        reset();
+      });
+      if (totalBytes > 200) {
+        log(`Downloaded ${filename}: ${totalBytes}B in ${chunks.length} chunks`, 'success');
+        const out = new Uint8Array(totalBytes);
+        let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
+        return out.buffer;
+      }
+    }
+    return null;
+  }
+  // ── End CB08-specific ─────────────────────────────────────────────
 
   async function tryListFiles() {
     const commands = ['AT+LIST\r\n', 'LIST\r\n', 'FILES\r\n', '{\"cmd\":\"list\"}\r\n', 'AT+DIR\r\n'];
@@ -1119,10 +1710,16 @@ const BLE = (() => {
     async connect(onFilesFound) {
       if (!navigator.bluetooth) throw new Error('Web Bluetooth not supported in this browser');
 
+      // Merge any user-supplied custom UUIDs into the candidate list
+      const cfg = Config.load() || {};
+      const extraUUIDs = (cfg.customUUIDs || []).filter(u => u && u.includes('-'));
+      const allCandidates = [...new Set([...CANDIDATE_SVCS, ...extraUUIDs])];
+      if (extraUUIDs.length) log(`Including ${extraUUIDs.length} custom UUID(s) from settings`, 'info');
+
       log('Requesting CB08 device...', 'info');
       device = await navigator.bluetooth.requestDevice({
         filters: [{ name: 'CB08' }],
-        optionalServices: CANDIDATE_SVCS
+        optionalServices: allCandidates
       });
 
       log(`Device selected: ${device.name} (${device.id})`, 'success');
@@ -1135,32 +1732,42 @@ const BLE = (() => {
       log('GATT server connected', 'success');
       emit('status', 'connected');
 
-      // Enumerate everything
-      const { services, discovered } = await enumerateServices();
+      // Enumerate everything — pass merged candidate list for the probe phase
+      const { services, discovered } = await enumerateServices(allCandidates);
 
       // Log raw metadata
       const devInfo = await readDeviceInfo(services, discovered);
       log('Device info: ' + JSON.stringify(devInfo), 'info');
 
-      // Try NUS
-      const nusOk = await setupNUS(services, discovered);
-
+      // Priority 1: CB08/JieLi specific services (confirmed on device)
       let files = [];
-      if (nusOk) {
-        log('Trying to list files via NUS...', 'info');
-        files = await tryListFiles();
-      } else {
-        log('NUS not available — trying readable characteristics...', 'warn');
-        // Try to read all readable characteristics for clues
+      const cb08Setup = await setupCB08(discovered);
+      if (cb08Setup) {
+        log(`CB08 protocol active via ${cb08Setup.label}`, 'success');
+        files = await cb08ListFiles();
+      }
+
+      // Priority 2: Nordic UART Service fallback
+      if (!cb08Setup || files.length === 0) {
+        const nusOk = await setupNUS(services, discovered);
+        if (nusOk) {
+          log('Trying file list via NUS...', 'info');
+          files = await tryListFiles();
+        }
+      }
+
+      // Priority 3: Read all readable characteristics and log raw data for analysis
+      if (files.length === 0) {
+        log('Reading all accessible characteristics for protocol analysis...', 'info');
         for (const [svcUUID, chars] of Object.entries(discovered)) {
           for (const c of chars) {
-            if (c.properties.read && !['battery_level','manufacturer_name_string','model_number_string'].includes(c.uuid)) {
+            if (c.properties.read) {
               try {
                 const val = await c.char.readValue();
                 const bytes = new Uint8Array(val.buffer);
-                const text = new TextDecoder('utf-8', { fatal: false }).decode(val);
-                log(`Read char ${c.uuid}: [${bytes.slice(0,16).join(',')}...] "${text.substring(0,60)}"`, 'info');
-              } catch {}
+                const text = new TextDecoder('utf-8', { fatal: false }).decode(val.buffer);
+                log(`Read svc=${svcUUID.slice(4,8)} char=${c.uuid.slice(4,8)}: hex=[${bytes.slice(0,20).join(',')}] text="${text.replace(/[^\x20-\x7e]/g,'·').substring(0,80)}"`, 'info');
+              } catch (e) { /* non-readable, skip */ }
             }
           }
         }
@@ -1172,6 +1779,9 @@ const BLE = (() => {
 
     async downloadFile(filename, progressCb) {
       if (!this.isConnected()) throw new Error('Not connected');
+      // Try CB08-specific download first, then NUS fallback
+      const result = await cb08DownloadFile(filename, progressCb);
+      if (result) return result;
       return downloadFileViaNUS(filename, progressCb);
     },
 
@@ -1238,14 +1848,15 @@ Return ONLY the reformatted transcript with speaker labels. No preamble, no expl
   }
 
   return {
-    async transcribe(audioBlob, filename, cfg) {
+    // Raw transcription of ONE blob (no diarization). Returns { rawText, meta }.
+    async transcribeRaw(audioBlob, filename, cfg) {
       const form = new FormData();
       form.append('file', audioBlob, filename);
       form.append('model', cfg.model);
       form.append('response_format', 'verbose_json');
       form.append('timestamp_granularities[]', 'segment');
 
-      console.log(`[API] Transcribing ${filename} (${(audioBlob.size/1024).toFixed(1)} KB) via ${cfg.baseURL}/audio/transcriptions`);
+      console.log(`[API] Transcribing ${filename} (${(audioBlob.size/1024/1024).toFixed(1)} MB) via ${cfg.baseURL}/audio/transcriptions`);
 
       const resp = await fetch(`${cfg.baseURL}/audio/transcriptions`, {
         method: 'POST',
@@ -1256,40 +1867,40 @@ Return ONLY the reformatted transcript with speaker labels. No preamble, no expl
       if (!resp.ok) {
         const err = await resp.text();
         console.error('[API] Transcription error:', err);
+        // Surface the common 25MB-limit error with a clearer message
+        if (resp.status === 413 || /maximum content size|too large|25 ?MB/i.test(err)) {
+          throw new Error(`File too large for the transcription endpoint (25MB limit). ${err}`);
+        }
         throw new Error(`Transcription API error ${resp.status}: ${err}`);
       }
 
       const data = await resp.json();
-      console.log('[API] Transcription raw response:', data);
-
-      // Log metadata
       const meta = {
-        language: data.language,
-        duration: data.duration,
-        segments: data.segments?.length,
-        words: data.words?.length,
-        task: data.task,
+        language: data.language, duration: data.duration,
+        segments: data.segments?.length, words: data.words?.length, task: data.task,
       };
-      console.log('[API] Transcription metadata:', meta);
-
       const rawText = data.text || (typeof data === 'string' ? data : JSON.stringify(data));
+      return { rawText, meta };
+    },
 
-      // Check if response already has speaker diarization
-      const hasSpeakers = /\b(speaker\s*\d|person\s*\d|spk_\d)/i.test(rawText);
-
-      let finalTranscript;
-      if (hasSpeakers) {
+    // Add speaker labels to a raw transcript (skips if already diarized).
+    async diarize(rawText, cfg) {
+      if (/\b(speaker\s*\d|person\s*\d|spk_\d)/i.test(rawText)) {
         console.log('[API] Transcript already contains speaker labels');
-        finalTranscript = rawText;
-      } else {
-        console.log('[API] Running speaker diarization via chat model...');
-        finalTranscript = await chatCompletion([
-          { role: 'system', content: DIARIZE_SYSTEM },
-          { role: 'user', content: rawText }
-        ], cfg);
+        return rawText;
       }
+      console.log('[API] Running speaker diarization via chat model...');
+      return chatCompletion([
+        { role: 'system', content: DIARIZE_SYSTEM },
+        { role: 'user', content: rawText }
+      ], cfg);
+    },
 
-      return { transcript: finalTranscript, rawTranscript: rawText, meta };
+    // Full single-blob flow: transcribe + diarize.
+    async transcribe(audioBlob, filename, cfg) {
+      const { rawText, meta } = await this.transcribeRaw(audioBlob, filename, cfg);
+      const transcript = await this.diarize(rawText, cfg);
+      return { transcript, rawTranscript: rawText, meta };
     },
 
     async summarize(transcript, cfg) {
@@ -1640,9 +2251,27 @@ async function connectBLE() {
   try {
     const { files, discovered, devInfo } = await BLE.connect(async (files, extra) => {
       if (files.length === 0) {
-        appendBleLog('No files auto-detected. Device may use a custom protocol.', 'warn');
-        appendBleLog('Check the BLE Log for discovered services. Manual upload is available as fallback.', 'warn');
-        toast('Connected but no files auto-detected. Check BLE Log for details.', 'warn', 6000);
+        appendBleLog('─── No files transferred over BLE ───', 'warn');
+        appendBleLog('We HAVE all 6 GATT services/characteristics — that is not the blocker.', 'warn');
+        appendBleLog('The blocker is the JieLi command protocol: every probe returns [0,0]', 'warn');
+        appendBleLog('("unknown command"). The device needs the exact byte sequence its own', 'warn');
+        appendBleLog('app sends, which cannot be brute-forced reliably from the browser.', 'warn');
+        appendBleLog('', 'warn');
+        appendBleLog('═══ TWO WAYS TO GET YOUR RECORDINGS TODAY ═══', 'warn');
+        appendBleLog('① USB (easiest): plug CB08 into your computer with a data cable.', 'success');
+        appendBleLog('   JieLi recorders usually mount as a USB drive. Copy the .wav/.mp3', 'success');
+        appendBleLog('   files off it, then click "⬆ Upload File" here to transcribe them.', 'success');
+        appendBleLog('② Companion app export: open the official CB08 app, export/share a', 'success');
+        appendBleLog('   recording to Files, then upload it here.', 'success');
+        appendBleLog('', 'warn');
+        appendBleLog('═══ TO MAKE BLE AUTO-DOWNLOAD WORK (one-time capture) ═══', 'info');
+        appendBleLog('On Android: Settings → Developer options → enable "Bluetooth HCI', 'info');
+        appendBleLog('snoop log". Open the official CB08 app, let it list & play a recording,', 'info');
+        appendBleLog('then pull btsnoop_hci.log and open it in Wireshark. The ATT writes to', 'info');
+        appendBleLog('AE21 / 4a02 reveal the real list & download command bytes. Share those', 'info');
+        appendBleLog('and this app can replay them exactly.', 'info');
+        setBleStatus('Connected — BLE file transfer needs protocol capture. Use Upload File.', 'connected');
+        toast('Connected, but the device won\'t list files over BLE. Use USB + "Upload File", or capture the app\'s protocol (see BLE Log).', 'warn', 14000);
         return;
       }
 
@@ -1721,6 +2350,7 @@ function openSettings(allowCancel = true) {
   document.getElementById('cfgApiKey').value = cfg.apiKey || '';
   document.getElementById('cfgModel').value = cfg.model || '';
   document.getElementById('cfgChatModel').value = cfg.chatModel || '';
+  document.getElementById('cfgCustomUUIDs').value = (cfg.customUUIDs || []).join('\n');
   document.getElementById('settingsCancelBtn').style.display = allowCancel ? 'inline-flex' : 'none';
   document.getElementById('settingsModal').classList.add('open');
 }
@@ -1735,13 +2365,15 @@ document.getElementById('settingsSaveBtn').addEventListener('click', () => {
   const apiKey = document.getElementById('cfgApiKey').value.trim();
   const model = document.getElementById('cfgModel').value.trim();
   const chatModel = document.getElementById('cfgChatModel').value.trim();
+  const customUUIDs = document.getElementById('cfgCustomUUIDs').value
+    .split(/[\n,]+/).map(s => s.trim().toLowerCase()).filter(s => s.includes('-'));
 
   if (!baseURL || !apiKey || !model) {
     toast('Please fill in Base URL, API Key, and Model Name', 'warn');
     return;
   }
 
-  Config.save({ baseURL, apiKey, model, chatModel });
+  Config.save({ baseURL, apiKey, model, chatModel, customUUIDs });
   document.getElementById('settingsModal').classList.remove('open');
   toast('Settings saved', 'success');
 });
@@ -1782,6 +2414,236 @@ document.addEventListener('drop', async (e) => {
     await processAudio(file, file.name, date);
   }
 });
+
+// ─────────────────────────────────────────────────────────────────
+// IMPORT FROM MOUNTED DRIVE  (File System Access API)
+// The CB08/AIRec recorder mounts as a USB Mass-Storage drive. Chrome/Edge
+// can read it directly — no app, no BLE protocol. Recordings live in /record
+// as note<YYYYMMDD>-<HHMMSS>.wav (16kHz mono PCM).
+// ─────────────────────────────────────────────────────────────────
+const WHISPER_MAX_BYTES = 24 * 1024 * 1024; // stay safely under the 25MB API limit
+
+// Split a standard PCM WAV Blob into <=maxBytes sub-WAVs, each with a valid header.
+// Returns array of { blob, index, total }. Non-PCM/odd-header files return [] (caller
+// should fall back to sending the whole file).
+async function splitWavPCM(blob, maxBytes = WHISPER_MAX_BYTES) {
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  const dv = new DataView(buf.buffer);
+  // Verify RIFF/WAVE
+  if (dv.getUint32(0, false) !== 0x52494646 /*RIFF*/ ||
+      dv.getUint32(8, false) !== 0x57415645 /*WAVE*/) return [];
+
+  // Walk chunks to find 'fmt ' and 'data'
+  let off = 12, fmt = null, dataOff = 0, dataLen = 0;
+  while (off + 8 <= buf.length) {
+    const id = dv.getUint32(off, false);
+    const sz = dv.getUint32(off + 4, true);
+    if (id === 0x666d7420 /*'fmt '*/) {
+      // fmt fields are relative to the chunk-data start (off+8):
+      //   +0 audioFormat, +2 numChannels, +4 sampleRate, +8 byteRate,
+      //   +12 blockAlign, +14 bitsPerSample
+      fmt = {
+        audioFormat:   dv.getUint16(off + 8,  true),
+        numChannels:   dv.getUint16(off + 10, true),
+        sampleRate:    dv.getUint32(off + 12, true),
+        byteRate:      dv.getUint32(off + 16, true),
+        blockAlign:    dv.getUint16(off + 20, true),
+        bitsPerSample: dv.getUint16(off + 22, true),
+      };
+    } else if (id === 0x64617461 /*'data'*/) {
+      dataOff = off + 8; dataLen = sz; break;
+    }
+    off += 8 + sz + (sz & 1); // chunks are word-aligned
+  }
+  if (!fmt || fmt.audioFormat !== 1 /*PCM*/ || !dataLen) return [];
+
+  const pcm = buf.subarray(dataOff, dataOff + dataLen);
+  const blockAlign = fmt.blockAlign || (fmt.numChannels * fmt.bitsPerSample / 8);
+  // Max PCM bytes per chunk, aligned down to whole sample frames
+  let perChunk = Math.floor((maxBytes - 44) / blockAlign) * blockAlign;
+  if (perChunk <= 0) perChunk = blockAlign;
+  const total = Math.ceil(pcm.length / perChunk);
+  if (total <= 1) return []; // fits in one piece; caller sends whole file
+
+  const chunks = [];
+  for (let i = 0; i < total; i++) {
+    const slice = pcm.subarray(i * perChunk, Math.min((i + 1) * perChunk, pcm.length));
+    chunks.push({ blob: buildWavBlob(fmt, slice), index: i + 1, total });
+  }
+  return chunks;
+}
+
+// Build a 44-byte-header PCM WAV Blob from fmt params + raw PCM bytes.
+function buildWavBlob(fmt, pcmBytes) {
+  const header = new ArrayBuffer(44);
+  const v = new DataView(header);
+  const writeStr = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  const dataLen = pcmBytes.length;
+  writeStr(0, 'RIFF');
+  v.setUint32(4, 36 + dataLen, true);
+  writeStr(8, 'WAVE');
+  writeStr(12, 'fmt ');
+  v.setUint32(16, 16, true);
+  v.setUint16(20, 1, true); // PCM
+  v.setUint16(22, fmt.numChannels, true);
+  v.setUint32(24, fmt.sampleRate, true);
+  v.setUint32(28, fmt.sampleRate * fmt.numChannels * fmt.bitsPerSample / 8, true);
+  v.setUint16(32, fmt.numChannels * fmt.bitsPerSample / 8, true);
+  v.setUint16(34, fmt.bitsPerSample, true);
+  writeStr(36, 'data');
+  v.setUint32(40, dataLen, true);
+  return new Blob([header, pcmBytes], { type: 'audio/wav' });
+}
+
+// Transcribe one recording File, auto-chunking if it exceeds the API size limit.
+// Stitches chunk transcripts, runs ONE diarization pass, then saves to IndexedDB.
+async function importRecordingFile(file, filename, date) {
+  const cfg = Config.load();
+  if (!cfg) { toast('Please configure API settings first', 'warn'); return false; }
+
+  // Skip if already transcribed
+  const existing = await DB.getByFilename(filename);
+  if (existing?.transcript) {
+    appendBleLog(`Skipping ${filename} — already transcribed`, 'success');
+    return false;
+  }
+
+  // Small enough → reuse the standard single-shot pipeline
+  if (file.size <= WHISPER_MAX_BYTES) {
+    await processAudio(file, filename, date);
+    return true;
+  }
+
+  // Oversized WAV → split into PCM chunks
+  appendBleLog(`${filename} is ${(file.size/1024/1024).toFixed(0)}MB — splitting for the 25MB API limit…`, 'info');
+  const chunks = await splitWavPCM(file);
+  if (!chunks.length) {
+    // Couldn't split (not PCM WAV) — try sending whole and let API report
+    appendBleLog(`Could not split ${filename}; attempting full upload…`, 'warn');
+    await processAudio(file, filename, date);
+    return true;
+  }
+
+  const id = `rec_${Date.now()}_${Math.random().toString(36).slice(2,7)}`;
+  let rec = { id, filename, date: date instanceof Date ? date.toISOString() : date,
+              size: file.size, downloadedAt: new Date().toISOString(),
+              processing: true, progress: 5, error: null };
+  await DB.save(rec); await refreshGrid();
+
+  try {
+    const parts = [];
+    let totalDuration = 0, lang;
+    for (const { blob, index, total } of chunks) {
+      appendBleLog(`  Transcribing ${filename} — part ${index}/${total} (${(blob.size/1024/1024).toFixed(1)}MB)…`, 'info');
+      toast(`Transcribing ${filename} (part ${index}/${total})…`, 'info', 8000);
+      const { rawText, meta } = await API.transcribeRaw(blob, `${filename}.part${index}.wav`, cfg);
+      parts.push(rawText.trim());
+      totalDuration += meta.duration || 0;
+      lang = lang || meta.language;
+      rec.progress = Math.round((index / total) * 80);
+      await DB.save(rec); await refreshGrid();
+    }
+    const rawCombined = parts.join('\n');
+    appendBleLog(`  Diarizing ${filename} (combined ${chunks.length} parts)…`, 'info');
+    const transcript = await API.diarize(rawCombined, cfg);
+
+    rec.rawTranscript = rawCombined;
+    rec.transcript = transcript;
+    rec.meta = { language: lang, duration: totalDuration, parts: chunks.length };
+    rec.transcribedAt = new Date().toISOString();
+    rec.processing = false; rec.progress = 100;
+    // Don't store >50MB audio
+    await DB.save(rec); await refreshGrid();
+    appendBleLog(`✓ Transcribed ${filename} (${chunks.length} parts stitched)`, 'success');
+    toast(`Transcribed: ${filename}`, 'success');
+    return true;
+  } catch (err) {
+    console.error('[Import] failed:', err);
+    rec.error = err.message; rec.processing = false;
+    await DB.save(rec); await refreshGrid();
+    appendBleLog(`✗ ${filename}: ${err.message}`, 'error');
+    toast(`Failed: ${filename} — ${err.message}`, 'error', 6000);
+    return false;
+  }
+}
+
+// Recursively collect audio file handles from a directory handle.
+async function* walkAudioFiles(dirHandle, path = '') {
+  for await (const entry of dirHandle.values()) {
+    if (entry.kind === 'file' && /\.(wav|mp3|m4a|ogg|flac|webm)$/i.test(entry.name)) {
+      yield { handle: entry, path: path + entry.name };
+    } else if (entry.kind === 'directory') {
+      yield* walkAudioFiles(entry, path + entry.name + '/');
+    }
+  }
+}
+
+async function importFromDrive() {
+  if (!window.showDirectoryPicker) {
+    toast('Your browser lacks the File System Access API. Use Chrome or Edge (desktop), or the "Upload File" button.', 'error', 9000);
+    return;
+  }
+  let dirHandle;
+  try {
+    dirHandle = await window.showDirectoryPicker({ id: 'cb08-airec', mode: 'read' });
+  } catch (e) {
+    if (e.name === 'AbortError') return; // user cancelled
+    toast(`Could not open folder: ${e.message}`, 'error');
+    return;
+  }
+
+  document.getElementById('bleLog').style.display = 'block';
+  appendBleLog(`📂 Scanning "${dirHandle.name}" for recordings…`, 'info');
+  setBleStatus(`Importing from ${dirHandle.name}…`, 'connecting');
+
+  // Collect all audio files. Prefer .wav when a .opus twin exists (opus is a
+  // proprietary "KA" container the API can't read).
+  const found = [];
+  try {
+    for await (const f of walkAudioFiles(dirHandle)) found.push(f);
+  } catch (e) {
+    appendBleLog(`Scan error: ${e.message}`, 'error');
+  }
+
+  // De-dupe note<...>.wav vs note<...>.opus → keep wav
+  const byStem = new Map();
+  for (const f of found) {
+    const stem = f.path.replace(/\.(wav|mp3|m4a|ogg|flac|webm)$/i, '');
+    const ext = f.path.split('.').pop().toLowerCase();
+    const cur = byStem.get(stem);
+    const rank = e => (e === 'wav' ? 3 : e === 'flac' ? 2 : e === 'mp3' ? 1 : 0);
+    if (!cur || rank(ext) > rank(cur.path.split('.').pop().toLowerCase())) byStem.set(stem, f);
+  }
+  const wavs = [...byStem.values()];
+
+  if (!wavs.length) {
+    appendBleLog('No .wav/.mp3/.m4a/.ogg/.flac recordings found in that folder.', 'warn');
+    appendBleLog('Tip: pick the drive root (e.g. AIRec) or its "record" subfolder.', 'info');
+    setBleStatus('No recordings found in selected folder', 'connected');
+    toast('No recordings found. Pick the AIRec drive or its "record" folder.', 'warn', 7000);
+    return;
+  }
+
+  appendBleLog(`Found ${wavs.length} recording(s). Importing (skipping any already transcribed)…`, 'success');
+  setBleStatus(`Importing ${wavs.length} recording(s)…`, 'connecting');
+
+  let done = 0, imported = 0;
+  for (const { handle, path } of wavs) {
+    const file = await handle.getFile();
+    const name = handle.name;
+    const date = parseFilenameDate(name) || new Date(file.lastModified) || new Date();
+    console.log(`[Import] ${path}`, { size: file.size, date: date.toISOString() });
+    appendBleLog(`[${++done}/${wavs.length}] ${name} (${(file.size/1024/1024).toFixed(1)}MB, ${date.toLocaleString()})`, 'info');
+    const ok = await importRecordingFile(file, name, date);
+    if (ok) imported++;
+  }
+
+  appendBleLog(`✓ Import complete — ${imported} new, ${wavs.length - imported} skipped/failed.`, 'success');
+  setBleStatus(`Imported ${imported} recording(s) from ${dirHandle.name}`, 'connected');
+  toast(`Done — ${imported} new recording(s) transcribed.`, 'success', 6000);
+}
+
+document.getElementById('importDriveBtn').addEventListener('click', importFromDrive);
 
 // ─────────────────────────────────────────────────────────────────
 // EXPORT ALL
@@ -1841,9 +2703,13 @@ function parseFilenameDate(name) {
   if (!cfg) {
     openSettings(false);
   } else {
-    setBleStatus('Ready — click "Connect CB08" or upload files manually');
+    setBleStatus('Ready — mount the CB08 as a USB drive, then click "Import from Drive"');
     appendBleLog('App initialized. API configured.', 'success');
-    appendBleLog('Web Bluetooth requires Chrome/Edge on HTTPS. Make sure the device is nearby and powered on.', 'info');
+    appendBleLog('RECOMMENDED: plug the CB08 in (it mounts as a USB drive, e.g. "AIRec"),', 'info');
+    appendBleLog('then click "Import from Drive" and pick the drive (or its /record folder).', 'info');
+    appendBleLog('All recordings import & transcribe automatically; already-done files are skipped.', 'info');
+    appendBleLog('Large recordings are split in-browser to fit the 25MB transcription limit.', 'info');
+    appendBleLog('("BLE (experimental)" stays available, but the JieLi protocol is undocumented.)', 'info');
   }
 })();
 </script>
